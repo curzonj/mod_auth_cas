@@ -48,6 +48,8 @@
 #include "util_md5.h"
 #include "ap_config.h"
 #include "ap_release.h"
+#include "apr.h"
+#include "apr_errno.h"
 #include "apr_buckets.h"
 #include "apr_file_info.h"
 #include "apr_md5.h"
@@ -2056,41 +2058,196 @@ static int cas_post_config(apr_pool_t *pool, apr_pool_t *p1, apr_pool_t *p2, ser
 	return check_merged_vhost_configs(pool, s);
 }
 
-static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_input_mode_t mode, apr_read_type_e block, apr_off_t readbytes) {
-	apr_bucket *b;
-	apr_status_t rv;
-	apr_size_t len = 0, offset = 0;
-	char data[1024];
-	const char *bucketData;
+static int hex2dec(int c) {
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A';
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a';
+	}
+	return -1;
+}
 
-	memset(data, '\0', sizeof(data));
+static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_input_mode_t mode, apr_read_type_e block, apr_off_t readbytes) {
+	const char *data;
+	apr_size_t i, len;
+	apr_status_t rv;
+	apr_bucket *b;
+
+	/* the single sign-out request may be spread over several buckets
+	 * so we use a state machine to track its progress
+	 */
+	struct {
+		enum {
+			/* "logoutRequest=" */
+			s_logoutRequest_0,
+			s_logoutRequest_1,
+			s_logoutRequest_2,
+			s_logoutRequest_3,
+			s_logoutRequest_4,
+			s_logoutRequest_5,
+			s_logoutRequest_6,
+			s_logoutRequest_7,
+			s_logoutRequest_8,
+			s_logoutRequest_9,
+			s_logoutRequest_10,
+			s_logoutRequest_11,
+			s_logoutRequest_12,
+			s_logoutRequest_13,
+
+			/* URL-encoded XML */
+			s_url_encoded_xml,
+			s_hex_digit_1,
+			s_hex_digit_2,
+
+			/* bad request, this is an end state */
+			s_dead
+		} state;
+
+		apr_xml_parser *parser;
+
+		char hex_digit;
+	} *sm;
+
+	/* ignore sub-requests */
+	if (!ap_is_initial_req(f->r)) {
+		return APR_SUCCESS;
+	}
+
+	/* FIXME add a content_type="application/x-www-form-urlencoded" check? */
+
+	if (f->ctx == NULL) {
+		f->ctx = apr_pcalloc(f->r->pool, sizeof(*sm));
+	}
+
+	sm = f->ctx;
+
+	if (sm->state == s_dead) {
+		return APR_SUCCESS;
+	}
 
 	rv = ap_get_brigade(f->next, bb, mode, block, readbytes);
 
-	if(rv != APR_SUCCESS) {
-		apr_strerror(rv, data, sizeof(data));
-		ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, f->c->base_server, "unable to retrieve bucket brigade: %s", data);
+	if (rv != APR_SUCCESS) {
+		char errbuf[1024];
+
+		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
+				"unable to retrieve bucket brigade: %s", apr_strerror(rv, errbuf, sizeof(errbuf)));
+
 		return rv;
 	}
 
-	for(b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb); b = APR_BUCKET_NEXT(b)) {
-		if(APR_BUCKET_IS_METADATA(b))
+	/* The CAS single sign-out spec (what there is of it) does not
+	 * define a default encoding for the sign-out request.
+	 *
+	 * The CAS reference implementation sends the request as
+	 * application/x-www-form-urlencoded data with a single
+	 * key "logoutRequest" that contains UTF-8 encoded XML.
+	 *
+	 * The XML looks like this:
+	 *
+	 *   <samlp:LogoutRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="ST-1337-1337" Version="2.0" IssueInstant="2011-01-20T09:06:00Z">
+	 *     <saml:NameID xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">@NOT_USED@</saml:NameID>
+	 *     <samlp:SessionIndex>ST-1234-5678</samlp:SessionIndex>
+	 *   </samlp:LogoutRequest>
+	 *
+	 * We don't implement a full-fledged SAML protocol parser,
+	 * we simply build a DOM and look for <samlp:SessionIndex />.
+	 */
+	for (b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb) && sm->state != s_dead; b = APR_BUCKET_NEXT(b)) {
+		if (APR_BUCKET_IS_EOS(b)) {
+			apr_xml_doc *doc = NULL;
+
+			rv = apr_xml_parser_done(sm->parser, &doc);
+
+			if (rv != APR_SUCCESS) {
+				char errbuf[1024];
+
+				ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, f->r,
+						"error parsing single sign-out XML: %s", apr_strerror(rv, errbuf, sizeof(errbuf)));
+			}
+			else {
+				/* TODO look up <samlp:SessionIndex /> element and expire the corresponding session. */
+			}
+
 			continue;
-		if(apr_bucket_read(b, &bucketData, &len, APR_BLOCK_READ) == APR_SUCCESS) {
-			if(offset + len >= sizeof(data)) {
-				// hack below casts strlen() to unsigned long to avoid %zu vs. %Iu on Linux vs. Win 
-				ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, f->c->base_server, "bucket brigade contains more than %lu bytes, truncation required (SSOut may fail)", (unsigned long) sizeof(data));
-				memcpy(data + offset, bucketData, (sizeof(data) - offset) - 1); // copy what we can into the space remaining
-				break;
-			} else {
-				memcpy(data + offset, bucketData, len);
+		}
+
+		if (APR_BUCKET_IS_METADATA(b)) {
+			continue;
+		}
+
+		if (apr_bucket_read(b, &data, &len, block) != APR_SUCCESS) {
+			continue;
+		}
+
+		for (i = 0; i < len; i++) {
+			const char c = data[i];
+
+			if (sm->state >= s_logoutRequest_0 && sm->state <= s_logoutRequest_12) {
+				if (c == "logoutRequest="[sm->state]) {
+					sm->state++;
+				}
+				else {
+					sm->state = s_dead;
+				}
+			}
+			else if (sm->state == s_logoutRequest_13) {
+				if (c == '=') {
+					sm->parser = apr_xml_parser_create(f->r->pool);
+					sm->state = s_url_encoded_xml;
+				}
+				else {
+					sm->state = s_dead;
+				}
+			}
+			else if (sm->state == s_url_encoded_xml) {
+				if (c == '%') {
+					sm->state = s_hex_digit_1;
+				}
+				else {
+					rv = apr_xml_parser_feed(sm->parser, &c, 1);
+
+					if (rv != APR_SUCCESS) {
+						sm->state = s_dead;
+					}
+				}
+			}
+			else if (sm->state == s_hex_digit_1) {
+				int value = hex2dec(c);
+
+				if (value == -1) {
+					sm->state = s_dead;
+				}
+				else {
+					sm->state = s_hex_digit_2;
+					sm->hex_digit = value << 4;
+				}
+			}
+			else if (sm->state == s_hex_digit_2) {
+				int value = hex2dec(c);
+
+				if (value == -1) {
+					sm->state = s_dead;
+				}
+				else {
+					sm->hex_digit |= value;
+
+					rv = apr_xml_parser_feed(sm->parser, &sm->hex_digit, 1);
+
+					if (rv != APR_SUCCESS) {
+						sm->state = s_dead;
+					}
+					else {
+						sm->state = s_url_encoded_xml;
+					}
+				}
 			}
 		}
 	}
-
-	// hack below casts strlen() to unsigned long to avoid %zu vs. %Iu on Linux vs. Win 
-	ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, f->c->base_server, "read %lu bytes (%s) from incoming buckets\n", (unsigned long) strlen(data), data);
-	CASSAMLLogout(f->r, data);
 
 	return APR_SUCCESS;
 }
