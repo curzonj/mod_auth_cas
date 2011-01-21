@@ -48,6 +48,8 @@
 #include "util_md5.h"
 #include "ap_config.h"
 #include "ap_release.h"
+#include "apr.h"
+#include "apr_errno.h"
 #include "apr_buckets.h"
 #include "apr_file_info.h"
 #include "apr_md5.h"
@@ -1202,58 +1204,6 @@ static void expireCASST(request_rec *r, const char *ticketname)
 	deleteCASCacheFile(r, line);
 }
 
-static void CASSAMLLogout(request_rec *r, char *body)
-{
-	apr_xml_doc *doc;
-	apr_xml_elem *node;
-	char *line;
-	apr_xml_parser *parser = apr_xml_parser_create(r->pool);
-	cas_cfg *c = ap_get_module_config(r->server->module_config, &auth_cas_module);
-
-	if(body != NULL && strncmp(body, "logoutRequest=", 14) == 0) {
-		body += 14;
-		line = (char *) body;
-
-		/* convert + to ' ' or else the XML won't parse right */
-		do { 
-			if(*line == '+')
-				*line = ' ';
-			line++;
-		} while (*line != '\0');
-
-		ap_unescape_url((char *) body);
-
-		if(c->CASDebug)
-			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "SAML Logout Request: %s", body);
-
-		/* parse the XML response */
-		if(apr_xml_parser_feed(parser, body, strlen(body)) != APR_SUCCESS) {
-			line = apr_pcalloc(r->pool, 512);
-			apr_xml_parser_geterror(parser, line, 512);
-			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "MOD_AUTH_CAS: error parsing SAML logoutRequest: %s (incomplete SAML body?)", line);
-			return;
-		}
-		/* retrieve a DOM object */
-		if(apr_xml_parser_done(parser, &doc) != APR_SUCCESS) {
-			line = apr_pcalloc(r->pool, 512);
-			apr_xml_parser_geterror(parser, line, 512);
-			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "MOD_AUTH_CAS: error retrieving XML document for SAML logoutRequest: %s", line);
-			return;
-		}
-
-		node = doc->root->first_child;
-		while(node != NULL) {
-			if(apr_strnatcmp(node->name, "SessionIndex") == 0 && node->first_cdata.first != NULL) {
-				expireCASST(r, node->first_cdata.first->text);
-				return;
-			}
-			node = node->next;
-		}
-	}
-
-	return;
-}
-
 static void deleteCASCacheFile(request_rec *r, char *cookieName)
 {
 	char *path, *ticket;
@@ -2056,41 +2006,252 @@ static int cas_post_config(apr_pool_t *pool, apr_pool_t *p1, apr_pool_t *p2, ser
 	return check_merged_vhost_configs(pool, s);
 }
 
-static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_input_mode_t mode, apr_read_type_e block, apr_off_t readbytes) {
-	apr_bucket *b;
-	apr_status_t rv;
-	apr_size_t len = 0, offset = 0;
-	char data[1024];
-	const char *bucketData;
+static int hex2dec(int c) {
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'A' && c <= 'F') {
+		return 10 + (c - 'A');
+	}
+	if (c >= 'a' && c <= 'f') {
+		return 10 + (c - 'a');
+	}
+	return -1;
+}
 
-	memset(data, '\0', sizeof(data));
+/* the single sign-out request may be spread over several buckets
+ * so we use a state machine to track its progress
+ */
+typedef enum {
+	/* "logoutRequest=" */
+	s_logoutRequest_0,
+	s_logoutRequest_1,
+	s_logoutRequest_2,
+	s_logoutRequest_3,
+	s_logoutRequest_4,
+	s_logoutRequest_5,
+	s_logoutRequest_6,
+	s_logoutRequest_7,
+	s_logoutRequest_8,
+	s_logoutRequest_9,
+	s_logoutRequest_10,
+	s_logoutRequest_11,
+	s_logoutRequest_12,
+	s_logoutRequest_13,
+
+	/* URL-encoded XML */
+	s_url_encoded_xml,
+	s_hex_digit_1,
+	s_hex_digit_2,
+
+	/* bad request, this is an end state */
+	s_dead
+} cas_sso_state;
+
+static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_input_mode_t mode, apr_read_type_e block, apr_off_t readbytes) {
+	const char *data;
+	apr_size_t i, len;
+	apr_status_t rv;
+	apr_bucket *b;
+
+	struct {
+		apr_xml_parser *parser;
+		cas_sso_state state;
+		apr_size_t position;
+		char hex_digit;
+	} *sm;
+
+	/* ignore sub-requests */
+	if (!ap_is_initial_req(f->r)) {
+		return APR_SUCCESS;
+	}
+
+	/* FIXME add a content_type="application/x-www-form-urlencoded" check? */
+
+	sm = f->ctx;
+
+	if (sm == NULL) {
+		sm = f->ctx = apr_pcalloc(f->r->pool, sizeof(*sm));
+	}
+	else if (sm->state == s_dead) {
+		return APR_SUCCESS;
+	}
 
 	rv = ap_get_brigade(f->next, bb, mode, block, readbytes);
 
-	if(rv != APR_SUCCESS) {
-		apr_strerror(rv, data, sizeof(data));
-		ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, f->c->base_server, "unable to retrieve bucket brigade: %s", data);
+	if (rv != APR_SUCCESS) {
+		char errbuf[1024];
+
+		apr_strerror(rv, errbuf, sizeof(errbuf));
+
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+				"MOD_AUTH_CAS: unable to retrieve bucket brigade: %s", errbuf);
+
 		return rv;
 	}
 
-	for(b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb); b = APR_BUCKET_NEXT(b)) {
-		if(APR_BUCKET_IS_METADATA(b))
+	/* The CAS single sign-out spec (what there is of it) does not
+	 * define a default encoding for the sign-out request.
+	 *
+	 * The CAS reference implementation sends the request as
+	 * application/x-www-form-urlencoded data with a single
+	 * key "logoutRequest" that contains UTF-8 encoded XML.
+	 *
+	 * The XML looks like this:
+	 *
+	 *   <samlp:LogoutRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="ST-1337-1337" Version="2.0" IssueInstant="2011-01-20T09:06:00Z">
+	 *     <saml:NameID xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">@NOT_USED@</saml:NameID>
+	 *     <samlp:SessionIndex>ST-1234-5678</samlp:SessionIndex>
+	 *   </samlp:LogoutRequest>
+	 *
+	 * We don't implement a full-fledged SAML protocol parser,
+	 * we simply build a DOM and look for <samlp:SessionIndex />.
+	 */
+	for (b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb); b = APR_BUCKET_NEXT(b)) {
+		if (sm->state == s_dead) {
+			break;
+		}
+
+		if (APR_BUCKET_IS_EOS(b)) {
+			break;
+		}
+
+		if (APR_BUCKET_IS_METADATA(b)) {
 			continue;
-		if(apr_bucket_read(b, &bucketData, &len, APR_BLOCK_READ) == APR_SUCCESS) {
-			if(offset + len >= sizeof(data)) {
-				// hack below casts strlen() to unsigned long to avoid %zu vs. %Iu on Linux vs. Win 
-				ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, f->c->base_server, "bucket brigade contains more than %lu bytes, truncation required (SSOut may fail)", (unsigned long) sizeof(data));
-				memcpy(data + offset, bucketData, (sizeof(data) - offset) - 1); // copy what we can into the space remaining
-				break;
-			} else {
-				memcpy(data + offset, bucketData, len);
+		}
+
+		rv = apr_bucket_read(b, &data, &len, APR_BLOCK_READ);
+
+		if (rv != APR_SUCCESS) {
+			/* this can't really happen - all the request body buckets are HEAP buckets and those never fail */
+			break;
+		}
+
+		for (i = 0; i < len && sm->state != s_dead; i++) {
+			char c = data[i];
+
+			if (sm->state >= s_logoutRequest_0 && sm->state <= s_logoutRequest_12) {
+				if (c == "logoutRequest="[sm->state]) {
+					sm->state++;
+				}
+				else {
+					sm->state = s_dead;
+				}
+			}
+			else if (sm->state == s_logoutRequest_13) {
+				if (c == '=') {
+					sm->parser = apr_xml_parser_create(f->r->pool);
+					sm->state = s_url_encoded_xml;
+				}
+				else {
+					sm->state = s_dead;
+				}
+			}
+			else if (sm->state == s_hex_digit_1) {
+				int value = hex2dec(c);
+
+				if (value == -1) {
+					sm->state = s_dead;
+				}
+				else {
+					sm->state = s_hex_digit_2;
+					sm->hex_digit = value << 4;
+				}
+			}
+			else if (sm->state == s_hex_digit_2) {
+				int value = hex2dec(c);
+
+				if (value == -1) {
+					sm->state = s_dead;
+				}
+				else {
+					c = sm->hex_digit | value;
+					sm->state = s_url_encoded_xml;
+					goto feed_parser;
+				}
+			}
+			else if (sm->state == s_url_encoded_xml) {
+				if (c == '%') {
+					sm->state = s_hex_digit_1;
+				}
+				else {
+					if (c == '+') {
+						c = ' ';
+					}
+
+feed_parser:
+					/* feeding character data byte-by-byte sucks because the expat parser
+					 * will create a text node for each parsed character...
+					 */
+					rv = apr_xml_parser_feed(sm->parser, &c, 1);
+
+					if (rv == APR_SUCCESS) {
+						sm->position++;
+					}
+					else {
+						char errbuf[1024];
+
+						apr_xml_parser_geterror(
+								sm->parser, errbuf, sizeof(errbuf));
+
+						ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+								"MOD_AUTH_CAS: bad SAML logout request: %s at position %ld (character '%c')", errbuf, sm->position, c);
+
+						sm->state = s_dead;
+					}
+				}
 			}
 		}
 	}
 
-	// hack below casts strlen() to unsigned long to avoid %zu vs. %Iu on Linux vs. Win 
-	ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, f->c->base_server, "read %lu bytes (%s) from incoming buckets\n", (unsigned long) strlen(data), data);
-	CASSAMLLogout(f->r, data);
+	if (APR_BUCKET_IS_EOS(b) && sm->parser != NULL && sm->state != s_dead) {
+		apr_xml_elem *node;
+		apr_xml_doc *doc;
+		const char *ticket;
+		const char *ns;
+
+		rv = apr_xml_parser_done(sm->parser, &doc);
+
+		if (rv != APR_SUCCESS) {
+			char errbuf[1024];
+
+			apr_xml_parser_geterror(sm->parser, errbuf, sizeof(errbuf));
+
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, f->r,
+					"MOD_AUTH_CAS: bad SAML logout request: %s at position %ld", errbuf, sm->position);
+
+			/* hack: bail out early */
+			return APR_SUCCESS;
+		}
+
+		ticket = NULL;
+
+		/* look up <samlp:SessionIndex /> element */
+		for (node = doc->root->first_child; node != NULL; node = node->next) {
+			if (apr_strnatcmp(node->name, "SessionIndex") != 0) {
+				continue;
+			}
+
+			ns = ((const char **) doc->namespaces->elts)[node->ns];
+
+			if (ns == NULL || apr_strnatcmp(ns, "urn:oasis:names:tc:SAML:2.0:protocol") != 0) {
+				continue;
+			}
+
+			apr_xml_to_text(f->r->pool, node,
+					APR_XML_X2T_INNER, NULL, NULL, &ticket, NULL);
+
+			break;
+		}
+
+		if (ticket == NULL) {
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+					"MOD_AUTH_CAS: bad SAML logout request: <samlp:SessionIndex /> element not found.");
+		}
+		else {
+			expireCASST(f->r, ticket);
+		}
+	}
 
 	return APR_SUCCESS;
 }
