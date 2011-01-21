@@ -1204,58 +1204,6 @@ static void expireCASST(request_rec *r, const char *ticketname)
 	deleteCASCacheFile(r, line);
 }
 
-static void CASSAMLLogout(request_rec *r, char *body)
-{
-	apr_xml_doc *doc;
-	apr_xml_elem *node;
-	char *line;
-	apr_xml_parser *parser = apr_xml_parser_create(r->pool);
-	cas_cfg *c = ap_get_module_config(r->server->module_config, &auth_cas_module);
-
-	if(body != NULL && strncmp(body, "logoutRequest=", 14) == 0) {
-		body += 14;
-		line = (char *) body;
-
-		/* convert + to ' ' or else the XML won't parse right */
-		do { 
-			if(*line == '+')
-				*line = ' ';
-			line++;
-		} while (*line != '\0');
-
-		ap_unescape_url((char *) body);
-
-		if(c->CASDebug)
-			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "SAML Logout Request: %s", body);
-
-		/* parse the XML response */
-		if(apr_xml_parser_feed(parser, body, strlen(body)) != APR_SUCCESS) {
-			line = apr_pcalloc(r->pool, 512);
-			apr_xml_parser_geterror(parser, line, 512);
-			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "MOD_AUTH_CAS: error parsing SAML logoutRequest: %s (incomplete SAML body?)", line);
-			return;
-		}
-		/* retrieve a DOM object */
-		if(apr_xml_parser_done(parser, &doc) != APR_SUCCESS) {
-			line = apr_pcalloc(r->pool, 512);
-			apr_xml_parser_geterror(parser, line, 512);
-			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "MOD_AUTH_CAS: error retrieving XML document for SAML logoutRequest: %s", line);
-			return;
-		}
-
-		node = doc->root->first_child;
-		while(node != NULL) {
-			if(apr_strnatcmp(node->name, "SessionIndex") == 0 && node->first_cdata.first != NULL) {
-				expireCASST(r, node->first_cdata.first->text);
-				return;
-			}
-			node = node->next;
-		}
-	}
-
-	return;
-}
-
 static void deleteCASCacheFile(request_rec *r, char *cookieName)
 {
 	char *path, *ticket;
@@ -2134,8 +2082,10 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 	if (rv != APR_SUCCESS) {
 		char errbuf[1024];
 
+		apr_strerror(rv, errbuf, sizeof(errbuf));
+
 		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
-				"unable to retrieve bucket brigade: %s", apr_strerror(rv, errbuf, sizeof(errbuf)));
+				"unable to retrieve bucket brigade: %s", errbuf);
 
 		return rv;
 	}
@@ -2157,35 +2107,28 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 	 * We don't implement a full-fledged SAML protocol parser,
 	 * we simply build a DOM and look for <samlp:SessionIndex />.
 	 */
-	for (b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb) && sm->state != s_dead; b = APR_BUCKET_NEXT(b)) {
+	for (b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb); b = APR_BUCKET_NEXT(b)) {
 		if (APR_BUCKET_IS_EOS(b)) {
-			apr_xml_doc *doc = NULL;
-
-			rv = apr_xml_parser_done(sm->parser, &doc);
-
-			if (rv != APR_SUCCESS) {
-				char errbuf[1024];
-
-				ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, f->r,
-						"error parsing single sign-out XML: %s", apr_strerror(rv, errbuf, sizeof(errbuf)));
-			}
-			else {
-				/* TODO look up <samlp:SessionIndex /> element and expire the corresponding session. */
-			}
-
-			continue;
+			break;
 		}
 
 		if (APR_BUCKET_IS_METADATA(b)) {
 			continue;
 		}
 
-		if (apr_bucket_read(b, &data, &len, block) != APR_SUCCESS) {
+		if (sm->state == s_dead) {
+			continue;
+		}
+
+		/* TODO first try a non-blocking read; on APR_EAGAIN, flush and retry in blocking mode */
+		rv = apr_bucket_read(b, &data, &len, APR_BLOCK_READ);
+
+		if (rv != APR_SUCCESS) {
 			continue;
 		}
 
 		for (i = 0; i < len; i++) {
-			const char c = data[i];
+			char c = data[i];
 
 			if (sm->state >= s_logoutRequest_0 && sm->state <= s_logoutRequest_12) {
 				if (c == "logoutRequest="[sm->state]) {
@@ -2209,6 +2152,10 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 					sm->state = s_hex_digit_1;
 				}
 				else {
+					if (c == '+') {
+						c = ' ';
+					}
+
 					rv = apr_xml_parser_feed(sm->parser, &c, 1);
 
 					if (rv != APR_SUCCESS) {
@@ -2245,6 +2192,42 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 						sm->state = s_url_encoded_xml;
 					}
 				}
+			}
+		}
+	}
+
+	if (sm->state != s_dead && APR_BUCKET_IS_EOS(b)) {
+		apr_xml_elem *node;
+		apr_xml_doc *doc;
+
+		doc = NULL;
+		rv = apr_xml_parser_done(sm->parser, &doc);
+
+		if (rv != APR_SUCCESS) {
+			char errbuf[1024];
+
+			apr_xml_parser_geterror(sm->parser, errbuf, sizeof(errbuf));
+
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, f->r,
+					"MOD_AUTH_CAS: error parsing SAML logout request: %s", errbuf);
+		}
+		else {
+			int ok = 0;
+
+			/* look up <samlp:SessionIndex /> element */
+			for (node = doc->root->first_child; node != NULL; node = node->next) {
+				/* FIXME check that namespace == "urn:oasis:names:tc:SAML:2.0:protocol" */
+				if (apr_strnatcmp(node->name, "SessionIndex") && node->first_cdata.first != NULL) {
+					/* CHECKME can the ticket ID be spread over several text nodes? */
+					expireCASST(f->r, node->first_cdata.first->text);
+					ok = 1;
+					break;
+				}
+			}
+
+			if (!ok) {
+				ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+						"MOD_AUTH_CAS: <samlp:SessionIndex /> element not found.");
 			}
 		}
 	}
