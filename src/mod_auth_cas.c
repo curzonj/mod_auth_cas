@@ -2048,107 +2048,33 @@ typedef enum {
 	s_dead
 } cas_sso_state;
 
-typedef struct {
-	request_rec *request;
-	apr_xml_parser *parser;
-	cas_sso_state state;
-	char hex_digit;
-} cas_sso_sm;
-
-static void process_logout_request(void *arg) {
-	const char *ns;
-	const char *ticket;
-	apr_xml_elem *node;
-	apr_xml_doc *doc;
-	apr_status_t rv;
-	cas_sso_sm *sm;
-
-	sm = arg;
-
-	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, sm->request,
-			"in process_logout_request(), state=%d, dead?=%d", sm->state, sm->state == s_dead);
-
-	if (sm->state == s_dead && sm->parser == NULL) {
-		return;
-	}
-
-	rv = apr_xml_parser_done(sm->parser, &doc);
-
-	if (rv != APR_SUCCESS) {
-		char errbuf[1024];
-
-		apr_xml_parser_geterror(sm->parser, errbuf, sizeof(errbuf));
-
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, sm->request,
-				"MOD_AUTH_CAS: error parsing SAML logout request: %s", errbuf);
-
-		return;
-	}
-
-	ticket = NULL;
-
-	/* look up <samlp:SessionIndex /> element */
-	for (node = doc->root->first_child; node != NULL; node = node->next) {
-		if (apr_strnatcmp(node->name, "SessionIndex") != 0) {
-			continue;
-		}
-
-		ns = ((const char **) doc->namespaces->elts)[node->ns];
-
-		if (ns == NULL || apr_strnatcmp(ns, "urn:oasis:names:tc:SAML:2.0:protocol") != 0) {
-			continue;
-		}
-
-		apr_xml_to_text(sm->request->pool, node,
-				APR_XML_X2T_INNER, NULL, NULL, &ticket, NULL);
-
-		break;
-	}
-
-	if (ticket == NULL) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, sm->request,
-				"MOD_AUTH_CAS: <samlp:SessionIndex /> element not found.");
-	}
-	else {
-		expireCASST(sm->request, ticket);
-	}
-}
-
-#define RETURN(rv) \
-	do { \
-		char errbuf[1024]; \
-		apr_strerror(rv, errbuf, sizeof(errbuf)); \
-		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r, \
-				"MOD_AUTH_CAS: return with status=%d (%s)", rv, errbuf); \
-		return rv; \
-	} while (0);
-
 static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_input_mode_t mode, apr_read_type_e block, apr_off_t readbytes) {
 	const char *data;
 	apr_size_t i, len;
 	apr_status_t rv;
 	apr_bucket *b;
-	cas_sso_sm *sm;
 
-	rv = APR_SUCCESS;
+	struct {
+		apr_xml_parser *parser;
+		cas_sso_state state;
+		apr_size_t position;
+		char hex_digit;
+	} *sm;
 
 	/* ignore sub-requests */
 	if (!ap_is_initial_req(f->r)) {
-		RETURN(rv);
+		return APR_SUCCESS;
 	}
 
 	/* FIXME add a content_type="application/x-www-form-urlencoded" check? */
 
-	if (f->ctx == NULL) {
-		sm = f->ctx = apr_pcalloc(f->r->pool, sizeof(*sm));
-		sm->request = f->r;
-	}
-	else {
-		sm = f->ctx;
-	}
+	sm = f->ctx;
 
-	if (sm->state == s_dead) {
-		RETURN(rv);
+	if (sm == NULL) {
+		sm = f->ctx = apr_pcalloc(f->r->pool, sizeof(*sm));
+	}
+	else if (sm->state == s_dead) {
+		return APR_SUCCESS;
 	}
 
 	rv = ap_get_brigade(f->next, bb, mode, block, readbytes);
@@ -2161,7 +2087,7 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
 				"MOD_AUTH_CAS: unable to retrieve bucket brigade: %s", errbuf);
 
-		RETURN(rv);
+		return rv;
 	}
 
 	/* The CAS single sign-out spec (what there is of it) does not
@@ -2183,27 +2109,25 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 	 */
 	for (b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb); b = APR_BUCKET_NEXT(b)) {
 		if (sm->state == s_dead) {
-			/* should not happen */
-			RETURN(rv);
+			break;
 		}
 
 		if (APR_BUCKET_IS_EOS(b)) {
-			process_logout_request(sm);
-			continue;
+			break;
 		}
 
 		if (APR_BUCKET_IS_METADATA(b)) {
 			continue;
 		}
 
-		/* TODO first try a non-blocking read; on APR_EAGAIN, flush and retry in blocking mode */
 		rv = apr_bucket_read(b, &data, &len, APR_BLOCK_READ);
 
 		if (rv != APR_SUCCESS) {
-			RETURN(rv);
+			/* this can't really happen - all the request body buckets are HEAP buckets and those never fail */
+			break;
 		}
 
-		for (i = 0; i < len; i++) {
+		for (i = 0; i < len && sm->state != s_dead; i++) {
 			char c = data[i];
 
 			if (sm->state >= s_logoutRequest_0 && sm->state <= s_logoutRequest_12) {
@@ -2212,7 +2136,6 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 				}
 				else {
 					sm->state = s_dead;
-					RETURN(rv);
 				}
 			}
 			else if (sm->state == s_logoutRequest_13) {
@@ -2222,27 +2145,6 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 				}
 				else {
 					sm->state = s_dead;
-					RETURN(rv);
-				}
-			}
-			else if (sm->state == s_url_encoded_xml) {
-				if (c == '%') {
-					sm->state = s_hex_digit_1;
-				}
-				else {
-					if (c == '+') {
-						c = ' ';
-					}
-
-					/* feeding character data byte-by-byte sucks because the expat parser
-					 * will create a text node for each parsed character...
-					 */
-					rv = apr_xml_parser_feed(sm->parser, &c, 1);
-
-					if (rv != APR_SUCCESS) {
-						sm->state = s_dead;
-						RETURN(rv);
-					}
 				}
 			}
 			else if (sm->state == s_hex_digit_1) {
@@ -2250,7 +2152,6 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 
 				if (value == -1) {
 					sm->state = s_dead;
-					RETURN(rv);
 				}
 				else {
 					sm->state = s_hex_digit_2;
@@ -2262,26 +2163,97 @@ static apr_status_t cas_in_filter(ap_filter_t *f, apr_bucket_brigade *bb, ap_inp
 
 				if (value == -1) {
 					sm->state = s_dead;
-					RETURN(rv);
 				}
 				else {
-					sm->hex_digit |= value;
+					c = sm->hex_digit | value;
+					sm->state = s_url_encoded_xml;
+					goto feed_parser;
+				}
+			}
+			else if (sm->state == s_url_encoded_xml) {
+				if (c == '%') {
+					sm->state = s_hex_digit_1;
+				}
+				else {
+					if (c == '+') {
+						c = ' ';
+					}
 
-					rv = apr_xml_parser_feed(sm->parser, &sm->hex_digit, 1);
+feed_parser:
+					/* feeding character data byte-by-byte sucks because the expat parser
+					 * will create a text node for each parsed character...
+					 */
+					rv = apr_xml_parser_feed(sm->parser, &c, 1);
 
-					if (rv != APR_SUCCESS) {
-						sm->state = s_dead;
-						RETURN(rv);
+					if (rv == APR_SUCCESS) {
+						sm->position++;
 					}
 					else {
-						sm->state = s_url_encoded_xml;
+						char errbuf[1024];
+
+						apr_xml_parser_geterror(
+								sm->parser, errbuf, sizeof(errbuf));
+
+						ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+								"MOD_AUTH_CAS: bad SAML logout request: %s at position %ld (character '%c')", errbuf, sm->position, c);
+
+						sm->state = s_dead;
 					}
 				}
 			}
 		}
 	}
 
-	RETURN(rv);
+	if (APR_BUCKET_IS_EOS(b) && sm->parser != NULL && sm->state != s_dead) {
+		apr_xml_elem *node;
+		apr_xml_doc *doc;
+		const char *ticket;
+		const char *ns;
+
+		rv = apr_xml_parser_done(sm->parser, &doc);
+
+		if (rv != APR_SUCCESS) {
+			char errbuf[1024];
+
+			apr_xml_parser_geterror(sm->parser, errbuf, sizeof(errbuf));
+
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, f->r,
+					"MOD_AUTH_CAS: bad SAML logout request: %s at position %ld", errbuf, sm->position);
+
+			/* hack: bail out early */
+			return APR_SUCCESS;
+		}
+
+		ticket = NULL;
+
+		/* look up <samlp:SessionIndex /> element */
+		for (node = doc->root->first_child; node != NULL; node = node->next) {
+			if (apr_strnatcmp(node->name, "SessionIndex") != 0) {
+				continue;
+			}
+
+			ns = ((const char **) doc->namespaces->elts)[node->ns];
+
+			if (ns == NULL || apr_strnatcmp(ns, "urn:oasis:names:tc:SAML:2.0:protocol") != 0) {
+				continue;
+			}
+
+			apr_xml_to_text(f->r->pool, node,
+					APR_XML_X2T_INNER, NULL, NULL, &ticket, NULL);
+
+			break;
+		}
+
+		if (ticket == NULL) {
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+					"MOD_AUTH_CAS: bad SAML logout request: <samlp:SessionIndex /> element not found.");
+		}
+		else {
+			expireCASST(f->r, ticket);
+		}
+	}
+
+	return APR_SUCCESS;
 }
 
 static void cas_register_hooks(apr_pool_t *p)
